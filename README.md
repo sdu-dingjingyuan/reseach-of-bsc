@@ -40,7 +40,7 @@ finalize:
 - A validator must not vote within the span of its other votes . (Rule 2)
 - Validators always vote for their canonical chain’s latest block. (Rule 3)
 
-![image-20240919162108084](C:\Users\ding\AppData\Roaming\Typora\typora-user-images\image-20240919162108084.png)
+![image-20240919162108084](img/image-20240919162108084.png)
 
 #### 投票保存范围
 
