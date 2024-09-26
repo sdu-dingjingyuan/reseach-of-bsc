@@ -79,16 +79,16 @@ func (p *Parlia) GetFinalizedHeader(){
 
 ```go
 func (p *Parlia) assembleVoteAttestation(){
-    if p.VotePool == nil {
+	if p.VotePool == nil {
 		return 
 	}
-    parent := chain.GetHeaderByHash(header.ParentHash)
+	parent := chain.GetHeaderByHash(header.ParentHash)
 	snap, err := p.snapshot(chain, parent.Number.Uint64()-1, parent.ParentHash, nil)
 	votes := p.VotePool.FetchVoteByBlockHash(parent.Hash())
-    if len(votes) < 2/3 {
+	if len(votes) < 2/3 {
 		return 
 	}
-    justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
+	justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
 	attestation := &types.VoteAttestation{
 		Data: &types.VoteData{
 			SourceNumber: justifiedBlockNumber,
@@ -170,7 +170,8 @@ func (voteManager *VoteManager) loop() {
 			}
 			blockCountSinceMining++
 			if blockCountSinceMining <= blocksNumberSinceMining {
-				log.Warn("skip voting", "blockCountSinceMining", blockCountSinceMining, "blocksNumberSinceMining", blocksNumberSinceMining)//检查挖矿状态: 挖矿个数小于设定跳过投票
+				//检查挖矿状态: 挖矿个数小于设定跳过投票
+				log.Warn("skip voting", "blockCountSinceMining", blockCountSinceMining, "blocksNumberSinceMining", blocksNumberSinceMining)
 				continue
 			}
 
@@ -310,19 +311,19 @@ func writeBlockAndSetHead(){
     currentBlock = getCurrentBlock()
 	reorg, err = ReorgNeededWithFastFinality(currentBlock, block.Header())//判断justifiedNumber是否相同
     if reorg {
-		// Reorganise the chain if the parent is not the head block
-		if block.ParentHash() != currentBlock.Hash() {//存在分叉
-			reorg(currentBlock, block); err != nil {
-		}
+	// Reorganise the chain if the parent is not the head block
+	if block.ParentHash() != currentBlock.Hash() {//存在分叉
+		reorg(currentBlock, block); err != nil {
+	}
 }
         
 func ReorgNeededWithFastFinality(){
-    justifiedNumber = f.chain.GetJustifiedNumber(header)
+	justifiedNumber = f.chain.GetJustifiedNumber(header)
 	curJustifiedNumber = f.chain.GetJustifiedNumber(current)
-    if justifiedNumber == curJustifiedNumber {
+	if justifiedNumber == curJustifiedNumber {
 		return ReorgNeeded(current, header)//若justifiedNumber相同则判断难度值总和
 	}
-    return justifiedNumber > curJustifiedNumber, nil
+	return justifiedNumber > curJustifiedNumber, nil
 }
 
 ```
@@ -332,7 +333,7 @@ func ReorgNeededWithFastFinality(){
 ```go
 func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
 	//分别统计新旧链难度值
-    var (
+	var (
 		localTD  = f.chain.GetTd(current.Hash(), current.Number.Uint64())
 		externTd = f.chain.GetTd(extern.Hash(), extern.Number.Uint64())
 	)
