@@ -12,15 +12,21 @@ BSC here proposes to combine DPoS and PoA for consensus, so that:
 
 It takes several steps to finalize a block:
 
-1. A block is proposed by a validator and propagated to other validators（单个验证者提出区块并广播）
-2. Validators use their BLS private key to sign for the block as a vote message（投票消息为BLS签名）
-3. Gather the votes from validators into a pool（票池收集所有票数，本地会维护一个票池，通过网络同步）
-4. Aggregate the BLS signature if its direct parent block has gotten enough votes when proposing a new block（带有BLS私钥的直接父区块在提议新区块时获得了足够的票数，则聚合 BLS 签名）
-5. Set the aggregated vote attestation into the extra field of the new block's header（聚合签名成为证明保存至块头）
-6. Validators and full nodes who received the new block with the direct parent block's attestation can justify the direct parent block（）
-7. If there are two continuous blocks have been justified, then the previous one is finalized
+1. A block is proposed by a validator and propagated to other validators(单个验证者提出区块并广播)
 
-### Finality Rules
+   Validators use their BLS private key to sign for the block as a vote message(投票消息为BLS签名)
+
+2. Gather the votes from validators into a pool(票池收集所有票数，本地会维护一个票池，通过网络同步)
+
+3. Aggregate the BLS signature if its direct parent block has gotten enough votes when proposing a new block（带有BLS私钥的直接父区块在提议新区块时获得了足够的票数，则聚合 BLS 签名）
+
+4. Set the aggregated vote attestation into the extra field of the new block's header(聚合签名成为证明保存至块头)
+
+5. Validators and full nodes who received the new block with the direct parent block's attestation can justify the direct parent block(收到带有直接父区块证明的新区块的验证者和完整节点可以证明直接父区块的正确性)
+
+6. If there are two continuous blocks have been justified, then the previous one is finalized(如果有两个连续的区块已证明合理，则前一个区块最终确定)
+
+### Finality Rules：n+1和n+2两个区块有证明则n被确认
 
 justify:
 
@@ -34,10 +40,72 @@ finalize:
 
 (2) it is justified and its direct child is justified（该块和子块为justified block）
 
+### 投票的结构：一般表示为[SourceNumber->TargetNumber]比如[1->2]
+
+```go
+SourceNumber: justifiedBlockNumber,
+SourceHash:   justifiedBlockHash,
+TargetNumber: parent.Number.Uint64(),
+TargetHash:   parent.Hash(),
+```
+
+#### 获取Justified block：最新包含证明块的Target指向块
+
+```go
+func (p *Parlia) GetJustifiedNumberAndHash(){
+	...
+	head := headers[len(headers)-1]
+	snap= p.snapshot(chain, head.Number.Uint64(), head.Hash(), headers)
+	if snap.Attestation == nil {
+		return 0, chain.GetHeaderByNumber(0).Hash(), nil
+	}
+	return snap.Attestation.TargetNumber, snap.Attestation.TargetHash, nil
+}
+```
+
+#### 获取finalized block：最新包含证明块的Source指向块
+
+```go
+func (p *Parlia) GetFinalizedHeader(){
+	snap, err := p.snapshot(chain, header.Number.Uint64(), header.Hash(), nil)
+	if snap.Attestation == nil {
+		return chain.GetHeaderByNumber(0) // keep consistent with GetJustifiedNumberAndHash
+	}
+	return chain.GetHeader(snap.Attestation.SourceHash, snap.Attestation.SourceNumber)
+}
+```
+
+#### assembleVoteAttestation
+
+```go
+func (p *Parlia) assembleVoteAttestation(){
+    if p.VotePool == nil {
+		return 
+	}
+    parent := chain.GetHeaderByHash(header.ParentHash)
+	snap, err := p.snapshot(chain, parent.Number.Uint64()-1, parent.ParentHash, nil)
+	votes := p.VotePool.FetchVoteByBlockHash(parent.Hash())
+    if len(votes) < 2/3 {
+		return 
+	}
+    justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
+	attestation := &types.VoteAttestation{
+		Data: &types.VoteData{
+			SourceNumber: justifiedBlockNumber,
+			SourceHash:   justifiedBlockHash,
+			TargetNumber: parent.Number.Uint64(),
+			TargetHash:   parent.Hash(),
+		},
+	}
+}
+```
+
 ### Validator Vote Rules
 
+投票时机为验证者在收到新区块时进行投票（即使先收到当前高度的其他验证者的出块也会直接投票，并不是优先自己出的块）
+
 - A validator must not publish two distinct votes for the same height. (Rule 1)（验证者最多必须对任何目标 epoch 进行一次投票）
-- A validator must not vote within the span of its other votes . (Rule 2)
+- A validator must not vote within the span of its other votes . (Rule 2)（不可以同时投出类似[2->3]和[1->4]的票）
 - Validators always vote for their canonical chain’s latest block. (Rule 3)
 
 ![image-20240919162108084](img/image-20240919162108084.png)
@@ -50,7 +118,7 @@ lowerLimitOfVoteBlockNumber = 256
 upperLimitOfVoteBlockNumber = 11 // refer to fetcher.maxUncleDist
 ```
 
-#### core/vote/votemanager.go
+#### core/vote/votemanager.go：投票主函数
 
 ```go
 func (voteManager *VoteManager) loop() {
@@ -189,7 +257,9 @@ func (voteManager *VoteManager) loop() {
 }
 ```
 
-## ValidatorsList
+## ValidatorsList：在创世区块的extra字段中获取
+
+|---Extra Vanity---|---Validators Number and Validators Bytes (or Empty)---|---Vote Attestation (or Empty)---|---Extra Seal---|
 
 初始状态按照地址字典顺序排序，每个epoch从智能合约中更新验证者列表
 
@@ -203,21 +273,19 @@ func (s *Snapshot) validators() []common.Address {
 	sort.Sort(validatorsAscending(validators))
 	return validators
 }
-//parlia.go
-func (p *Parlia) verifyValidators(header *types.Header) error {
-	if header.Number.Uint64()%p.config.Epoch != 0 {
-		return nil
-	}
-	newValidators, voteAddressMap, err := p.getCurrentValidators(header.ParentHash, new(big.Int).Sub(header.Number, big.NewInt(1)))
-	if err != nil {
-		return err
-	}
-	// sort validator by address
-	sort.Sort(validatorsAscending(newValidators))
-}
 ```
 
+#### 判断节点是否为inturn
 
+##### 若当前区块高度除以验证者个数的余数等于该节点在验证者集中的下标，则该节点为inturn节点
+
+```go
+func (s *Snapshot) inturn(validator common.Address) bool {
+	validators := s.validators()
+	offset := (s.Number + 1) % uint64(len(validators))
+	return validators[offset] == validator
+}
+```
 
 ## Reward Rules:
 
@@ -234,11 +302,37 @@ The new longest chain rule can be described as follows.
 1. The fork that includes the higher justified block is considered as the longest chain.
 2. When the justified block is the same, fall back to compare the sum of the “Difficulty” field.
 
+#### core/blockchain.go
+
+```go
+//writeBlockAndSetHead函数：在插入新块时检测是否需要对链重组
+func writeBlockAndSetHead(){
+    currentBlock = getCurrentBlock()
+	reorg, err = ReorgNeededWithFastFinality(currentBlock, block.Header())//判断justifiedNumber是否相同
+    if reorg {
+		// Reorganise the chain if the parent is not the head block
+		if block.ParentHash() != currentBlock.Hash() {//存在分叉
+			reorg(currentBlock, block); err != nil {
+		}
+}
+        
+func ReorgNeededWithFastFinality(){
+    justifiedNumber = f.chain.GetJustifiedNumber(header)
+	curJustifiedNumber = f.chain.GetJustifiedNumber(current)
+    if justifiedNumber == curJustifiedNumber {
+		return ReorgNeeded(current, header)//若justifiedNumber相同则判断难度值总和
+	}
+    return justifiedNumber > curJustifiedNumber, nil
+}
+
+```
+
 #### bsc/core/forkchoice.go
 
 ```go
 func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
-	var (
+	//分别统计新旧链难度值
+    var (
 		localTD  = f.chain.GetTd(current.Hash(), current.Number.Uint64())
 		externTd = f.chain.GetTd(extern.Hash(), extern.Number.Uint64())
 	)
@@ -265,7 +359,7 @@ func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (b
 	externNum, localNum := extern.Number.Uint64(), current.Number.Uint64()
 	if externNum < localNum {
 		reorg = true
-	} else if externNum == localNum {
+	} else if externNum == localNum {//若难度值相同随机选择
 		var currentPreserve, externPreserve bool
 		if f.preserve != nil {
 			currentPreserve, externPreserve = f.preserve(current), f.preserve(extern)
@@ -276,92 +370,53 @@ func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (b
 }
 ```
 
-#### 获取Justified block
+## Slashing
 
-```go
-func (p *Parlia) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, headers []*types.Header) (uint64, common.Hash, error) {
-	...
-	head := headers[len(headers)-1]
-	snap, err := p.snapshot(chain, head.Number.Uint64(), head.Hash(), headers)
-	if snap.Attestation == nil {
-		return 0, chain.GetHeaderByNumber(0).Hash(), nil
-	}
-	return snap.Attestation.TargetNumber, snap.Attestation.TargetHash, nil
-}
-```
+Double Sign：一个验证者在多个具有相同高度或相同父块的块上签名；
 
-#### 获取finalized block
+Malicious Fast Finality Vote：验证者签署两张目标高度相同或一张选票的跨度包括另一张选票的跨度的快速终结选票；
 
-```go
-func (p *Parlia) GetFinalizedHeader(){
-	snap, err := p.snapshot(chain, header.Number.Uint64(), header.Hash(), nil)
-	if snap.Attestation == nil {
-		return chain.GetHeaderByNumber(0) // keep consistent with GetJustifiedNumberAndHash
-	}
-	return chain.GetHeader(snap.Attestation.SourceHash, snap.Attestation.SourceNumber)
-}
-```
+Unavailability：验证者可能会因为任何原因，特别是硬件、软件、配置或网络问题而错过轮到自己出块的时间。系统智能合约会记录每个验证者的失误阻塞指标。如果指标超过设定的阈值，验证者的阻塞奖励将不会发给他们，而是与其他表现较好的验证者共享。
 
-#### assembleVoteAttestation
+- 如果验证者在 24 小时内错过了超过 50 个区块，他们将不会获得区块奖励，反而将在其他验证者之间共享。
+- 如果验证者在 24 小时内错过了超过 150 个区块：
+  - **10BNB** 将从验证者的**质押** BNB 中slash
+  - 被slash的 BNB 将分配给参与下一次分配的验证者的地址
+  - 将验证者设置为持续时间为 **2** **天**，并将其从活跃验证者集中删除
 
-```go
-func (p *Parlia) assembleVoteAttestation(){
-    if p.VotePool == nil {
-		return 
-	}
-    parent := chain.GetHeaderByHash(header.ParentHash)
-	snap, err := p.snapshot(chain, parent.Number.Uint64()-1, parent.ParentHash, nil)
-	votes := p.VotePool.FetchVoteByBlockHash(parent.Hash())
-    if len(votes) < 2/3 {
-		return 
-	}
-    justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
-	attestation := &types.VoteAttestation{
-		Data: &types.VoteData{
-			SourceNumber: justifiedBlockNumber,
-			SourceHash:   justifiedBlockHash,
-			TargetNumber: parent.Number.Uint64(),
-			TargetHash:   parent.Hash(),
-		},
-	}
-}
-```
+## Produce block
 
-## How to Produce a new block？
+#### 1: Prepare
 
-#### Step1: Prepare
+- If (height % epoch)==0, 从合约中获取ValidatorSet
 
-A validator node prepares the block header of next block.
-
-- Load snapshot from cache or database,
-- If (height % epoch)==0, should fetch ValidatorSet from contract
-- Every epoch block, will store validators set message in field of block header to facilitate the implement of light client.`extraData`
-- The coinbase is the address of the validator
-
-#### Step2: FinalizeAndAssemble
+#### 2: FinalizeAndAssemble
 
 - If the validator is not the in turn validator, will call liveness slash contract to slash the expected validator and generate a slashing transaction.
 - If there is gas-fee in the block, will distribute **1/16** to system reward contract, the rest go to validator contract.
 
-#### Step3: Seal
+#### 3: Seal
 
 The final step before a validator broadcast the new block.
 
-- Sign all things in block header and append the signature to extraData.
-- If it is out of turn for validators to sign blocks, an honest validator it will wait for a random reasonable time.
+- 如果轮不到验证者出块，则会等待一个随机时间
 
-## How to Validate a block？
+## Validate block
 
-#### Step1: VerifyHeader
+#### 1: VerifyHeader
 
 Verify the block header when receiving a new block.
 
-- Verify the signature of the coinbase is in of the `extraData``blockheader`
-- Compare the block time of the and the expected block time that the signer suppose to use, will deny a that is smaller than expected. It helps to prevent a selfish validator from rushing to seal a block.`blockHeader``blockerHeader`
+- Verify the signature in the `extraData` of `blockheader`
+- Compare the block time of the and the expected block time that the signer suppose to use, will deny a that is smaller than expected. It helps to prevent a selfish validator from rushing to seal a block.`blockHeader`
 - The should be the signer and the difficulty should be expected value.`coinbase`
 
-#### Step2: Finalize
+#### 2: Finalize
 
 - If it is an epoch block, a validator node will fetch validatorSet from BSCValidatorSet and compare it with extra_data.
 - If the block is not generate by inturn validatorvalidaror, will call slash contract. if there is gas-fee in the block, will distribute 1/16 to system reward contract, the rest go to validator contract.
 - The transaction generated by the consensus engine must be the same as the tx in block.
+
+## 发现的问题
+
+1.出块的顺序并非是节点接受区块的顺序
