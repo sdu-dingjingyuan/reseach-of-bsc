@@ -8,7 +8,46 @@ BSC here proposes to combine DPoS and PoA for consensus, so that:
 2. Validators take turns to produce blocks in a PoA manner, similar to [Ethereum’s Clique](https://eips.ethereum.org/EIPS/eip-225) consensus design
 3. Validator set are elected in and out based on a staking based governance
 
+## Validators：
+
+BSC conducts a daily election process post **00:00 UTC** to select the top **45** active validators based on their staking rankings for block production. Among these, the **21** validators with the highest staked amounts are referred to as **Cabinets**, while the remaining **24** validators are known as **Candidates**. The remaining inactive validators must wait for the next round of elections to become active validators before they can participate in block production.
+
+**In the set of 45 active validators, each epoch selects 18 validators from the Cabinets and 3 validators from the Candidates, forming a group of 21 validators as the consensus validators set for the current epoch to produce blocks.** If a validator is elected as the consensus validator but fails to participate in produce blocks, it will face slashing consequences.
+
+初始从extra字段中获取验证者信息|---Extra Vanity---|---Validators Number（1byte） and Validators Bytes（20byte） (or Empty)---|---Vote Attestation(48byte) (or Empty)---|---Extra Seal---|，按照地址字典顺序排序，每个epoch（源码中设置为200）从智能合约中更新验证者列表。
+
+```go
+//Snapshot.go
+func parseValidators(){
+	n := len(validatorsBytes) / validatorBytesLength
+	cnsAddrs := make([]common.Address, n)
+	voteAddrs := make([]types.BLSPublicKey, n)
+	for i := 0; i < n; i++ {
+		cnsAddrs[i] = common.BytesToAddress(validatorsBytes[i*validatorBytesLength : i*validatorBytesLength+common.AddressLength])
+		copy(voteAddrs[i][:], validatorsBytes[i*validatorBytesLength+common.AddressLength:(i+1)*validatorBytesLength])
+	}
+}
+```
+
+#### 判断出块节点是否为inturn
+
+##### 若当前区块高度除以验证者个数的余数等于该节点在验证者集中的下标，则该节点为inturn节点
+
+```go
+func (s *Snapshot) inturn(validator common.Address) bool {
+	validators := s.validators()
+	offset := (s.Number + 1) % uint64(len(validators))
+	return validators[offset] == validator
+}
+```
+
 ## Fast Finality
+
+**Finality is critical for blockchain security, once the block is finalized, it wouldn’t be reverted anymore.** The fast finality feature is very useful, the users can make sure they get the accurate information from the latest finalized block, then they can decide what to do next instantly. More details of design, please to refer [BEP-126](https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP126.md)
+
+Before the coming Plato upgrade,to secure as much as BC, BSC users are encouraged to wait until receiving blocks sealed by more than ⅔*N+1 different validators. In that way, the BSC can be trusted at a similar security level to BC and can tolerate less than ⅓*N Byzantine validators.With 21 validators, **if the block time is 3 seconds, the ⅔*N+1 different validator seals will need a time period of (⅔*21+1)*3 = 45 seconds. Any critical applications for BSC may have to wait for ⅔*N+1 to ensure a relatively secure finality.** With above enhancement by slashing mechanism, ½*N+1 or even fewer blocks are enough as confirmation for most transactions.
+
+After the coming Plato upgrade, the feature will be enabled. The chain will be finalized within two blocks if ⅔*N or more validators vote normally, **otherwise the chain has a fixed number of blocks to reach probabilistic finality as before.`Fast Finality`**
 
 It takes several steps to finalize a block:
 
@@ -79,16 +118,16 @@ func (p *Parlia) GetFinalizedHeader(){
 
 ```go
 func (p *Parlia) assembleVoteAttestation(){
-	if p.VotePool == nil {
+    if p.VotePool == nil {
 		return 
 	}
-	parent := chain.GetHeaderByHash(header.ParentHash)
+    parent := chain.GetHeaderByHash(header.ParentHash)
 	snap, err := p.snapshot(chain, parent.Number.Uint64()-1, parent.ParentHash, nil)
 	votes := p.VotePool.FetchVoteByBlockHash(parent.Hash())
-	if len(votes) < 2/3 {
+    if len(votes) < 2/3 {
 		return 
 	}
-	justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
+    justifiedBlockNumber, justifiedBlockHash := p.GetJustifiedNumberAndHash(chain, []*types.Header{parent})
 	attestation := &types.VoteAttestation{
 		Data: &types.VoteData{
 			SourceNumber: justifiedBlockNumber,
@@ -97,6 +136,14 @@ func (p *Parlia) assembleVoteAttestation(){
 			TargetHash:   parent.Hash(),
 		},
 	}
+    // Prepare aggregated vote signature
+	voteAddrSet := make(map[types.BLSPublicKey]struct{}, len(votes))
+	signatures := make([][]byte, 0, len(votes))
+	for _, vote := range votes {
+		voteAddrSet[vote.VoteAddress] = struct{}{}
+		signatures = append(signatures, vote.Signature[:])
+	}
+	sigs, err := bls.MultipleSignaturesFromBytes(signatures)
 }
 ```
 
@@ -122,7 +169,6 @@ upperLimitOfVoteBlockNumber = 11 // refer to fetcher.maxUncleDist
 
 ```go
 func (voteManager *VoteManager) loop() {
-	log.Info("vote manager routine loop started")
 	defer voteManager.chainHeadSub.Unsubscribe()
 	defer voteManager.syncVoteSub.Unsubscribe()
 
@@ -170,8 +216,7 @@ func (voteManager *VoteManager) loop() {
 			}
 			blockCountSinceMining++
 			if blockCountSinceMining <= blocksNumberSinceMining {
-				//检查挖矿状态: 挖矿个数小于设定跳过投票
-				log.Warn("skip voting", "blockCountSinceMining", blockCountSinceMining, "blocksNumberSinceMining", blocksNumberSinceMining)
+				log.Warn("skip voting", "blockCountSinceMining", blockCountSinceMining, "blocksNumberSinceMining", blocksNumberSinceMining)//检查挖矿状态: 启动节点后挖矿数小于设定跳过投票
 				continue
 			}
 
@@ -258,36 +303,6 @@ func (voteManager *VoteManager) loop() {
 }
 ```
 
-## ValidatorsList：在创世区块的extra字段中获取
-
-|---Extra Vanity---|---Validators Number and Validators Bytes (or Empty)---|---Vote Attestation (or Empty)---|---Extra Seal---|
-
-初始状态按照地址字典顺序排序，每个epoch从智能合约中更新验证者列表
-
-```go
-//Snapshot.go
-func (s *Snapshot) validators() []common.Address {
-	validators := make([]common.Address, 0, len(s.Validators))
-	for v := range s.Validators {
-		validators = append(validators, v)
-	}
-	sort.Sort(validatorsAscending(validators))
-	return validators
-}
-```
-
-#### 判断节点是否为inturn
-
-##### 若当前区块高度除以验证者个数的余数等于该节点在验证者集中的下标，则该节点为inturn节点
-
-```go
-func (s *Snapshot) inturn(validator common.Address) bool {
-	validators := s.validators()
-	offset := (s.Number + 1) % uint64(len(validators))
-	return validators[offset] == validator
-}
-```
-
 ## Reward Rules:
 
 奖励在每个epoch结束时按权重分配
@@ -311,19 +326,19 @@ func writeBlockAndSetHead(){
     currentBlock = getCurrentBlock()
 	reorg, err = ReorgNeededWithFastFinality(currentBlock, block.Header())//判断justifiedNumber是否相同
     if reorg {
-	// Reorganise the chain if the parent is not the head block
-	if block.ParentHash() != currentBlock.Hash() {//存在分叉
-		reorg(currentBlock, block); err != nil {
-	}
+		// Reorganise the chain if the parent is not the head block
+		if block.ParentHash() != currentBlock.Hash() {//存在分叉
+			reorg(currentBlock, block); err != nil {
+		}
 }
         
 func ReorgNeededWithFastFinality(){
-	justifiedNumber = f.chain.GetJustifiedNumber(header)
+    justifiedNumber = f.chain.GetJustifiedNumber(header)
 	curJustifiedNumber = f.chain.GetJustifiedNumber(current)
-	if justifiedNumber == curJustifiedNumber {
+    if justifiedNumber == curJustifiedNumber {
 		return ReorgNeeded(current, header)//若justifiedNumber相同则判断难度值总和
 	}
-	return justifiedNumber > curJustifiedNumber, nil
+    return justifiedNumber > curJustifiedNumber, nil
 }
 
 ```
@@ -333,7 +348,7 @@ func ReorgNeededWithFastFinality(){
 ```go
 func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
 	//分别统计新旧链难度值
-	var (
+    var (
 		localTD  = f.chain.GetTd(current.Hash(), current.Number.Uint64())
 		externTd = f.chain.GetTd(extern.Hash(), extern.Number.Uint64())
 	)
@@ -373,17 +388,44 @@ func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (b
 
 ## Slashing
 
-Double Sign：一个验证者在多个具有相同高度或相同父块的块上签名；
+#### Double Sign：
 
-Malicious Fast Finality Vote：验证者签署两张目标高度相同或一张选票的跨度包括另一张选票的跨度的快速终结选票；
+- Two block headers have the same height and the same parent block hash
+- Two block headers are sealed by the same validator
+- Two signatures of these two blocks must not be the same
+- The time of these two blocks must be within the validity of the evidence, which is 24 hours
 
-Unavailability：验证者可能会因为任何原因，特别是硬件、软件、配置或网络问题而错过轮到自己出块的时间。系统智能合约会记录每个验证者的失误阻塞指标。如果指标超过设定的阈值，验证者的阻塞奖励将不会发给他们，而是与其他表现较好的验证者共享。
+If the evidence is valid:
 
-- 如果验证者在 24 小时内错过了超过 50 个区块，他们将不会获得区块奖励，反而将在其他验证者之间共享。
-- 如果验证者在 24 小时内错过了超过 150 个区块：
-  - **10BNB** 将从验证者的**质押** BNB 中slash
-  - 被slash的 BNB 将分配给参与下一次分配的验证者的地址
-  - 将验证者设置为持续时间为 **2** **天**，并将其从活跃验证者集中删除
+1. **200BNB** would be slashed from the **self-delegated** BNB of the validator
+2. The remaining slashed BNB will be allocated to the credit addresses of validators participating in the next distribution
+3. Set the validator with a duration of **30 days**, and remove it from the active validator set`jailed`
+
+#### Malicious Vote：
+
+- The target number voted by two votes lags behind the block header of the canonical chain by no more than 256
+- The source numbers of the two votes are both smaller than their respective target numbers
+- The source hash and target hash of the two votes are both not equal
+- The target number of the two votes is the same or the span of one vote includes the span of the other vote
+- The two votes are signed by the same voting key, and the verification of signatures are both passed
+- The voting key used for signing is in the list sent by the last two breathe blocks
+
+If the evidence is valid:
+
+1. **200BNB** would be slashed from the **self-delegated** BNB of the validator
+2. **5BNB** would allocate to the submitter from the system reward contract as a reward if the validator is active when the evidence submitted
+3. The remaining slashed BNB will be allocated to the credit addresses of validators participating in the next distribution
+4. Set the validator with a duration of **30 days**, and remove it from the active validator set`jailed`
+
+#### Unavailability：
+
+If a validator misses over 50 blocks in 24 hours, they will not receive the block reward; instead, it will be shared among other validators.
+
+If a validator misses more than 150 blocks in 24 hours:
+
+1. **10BNB** would be slashed from the **self-delegated** BNB of the validator
+2. The slashed BNB will be allocated to the credit addresses of validators participating in the next distribution
+3. Set the validator with a duration of **2 days**, and remove it from the active validator set`jailed`
 
 ## Produce block
 
