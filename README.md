@@ -12,7 +12,7 @@ BSC here proposes to combine DPoS and PoA for consensus, so that:
 
 BSC conducts a daily election process post **00:00 UTC** to select the top **45** active validators based on their staking rankings for block production. Among these, the **21** validators with the highest staked amounts are referred to as **Cabinets**, while the remaining **24** validators are known as **Candidates**. The remaining inactive validators must wait for the next round of elections to become active validators before they can participate in block production.
 
-**In the set of 45 active validators, each epoch selects 18 validators from the Cabinets and 3 validators from the Candidates, forming a group of 21 validators as the consensus validators set for the current epoch to produce blocks.** If a validator is elected as the consensus validator but fails to participate in produce blocks, it will face slashing consequences.
+**In the set of 45 active validators, each epoch selects 18 validators from the Cabinets and 3 validators from the Candidates, forming a group of 21 validators as the consensus validators set for the current epoch to produce blocks.** If a validator is elected as the consensus validator but fails to participate in produce blocks, it will face slashing consequences.（18/21+3/24=21/45）
 
 初始从extra字段中获取验证者信息|---Extra Vanity---|---Validators Number（1byte） and Validators Bytes（20byte） (or Empty)---|---Vote Attestation(48byte) (or Empty)---|---Extra Seal---|，按照地址字典顺序排序，每个epoch（源码中设置为200）从智能合约中更新验证者列表。
 
@@ -303,13 +303,79 @@ func (voteManager *VoteManager) loop() {
 }
 ```
 
+#### 检查投票规则
+
+```go
+// UnderRules checks if the produced header under the following rules:
+// A validator must not publish two distinct votes for the same height. (Rule 1)
+// A validator must not vote within the span of its other votes . (Rule 2)
+// Validators always vote for their canonical chain’s latest block. (Rule 3)
+func (voteManager *VoteManager) UnderRules(header *types.Header) (bool, uint64, common.Hash) {
+	sourceNumber, sourceHash, err := voteManager.engine.GetJustifiedNumberAndHash(voteManager.chain, []*types.Header{header})
+	if err != nil {
+		log.Error("failed to get the highest justified number and hash at cur header", "curHeader's BlockNumber", header.Number, "curHeader's BlockHash", header.Hash())
+		return false, 0, common.Hash{}
+	}
+
+	targetNumber := header.Number.Uint64()
+
+	voteDataBuffer := voteManager.journal.voteDataBuffer
+	//Rule 1:  A validator must not publish two distinct votes for the same height.
+	if voteDataBuffer.Contains(targetNumber) {
+		log.Warn("err: A validator must not publish two distinct votes for the same height.")
+		return false, 0, common.Hash{}
+	}
+
+	//Rule 2: A validator must not vote within the span of its other votes.
+	blockNumber := sourceNumber + 1
+	if blockNumber+maliciousVoteSlashScope < targetNumber {
+		blockNumber = targetNumber - maliciousVoteSlashScope
+	}
+	for ; blockNumber < targetNumber; blockNumber++ {
+		if voteDataBuffer.Contains(blockNumber) {
+			voteData, ok := voteDataBuffer.Get(blockNumber)
+			if !ok {
+				log.Error("Failed to get voteData info from LRU cache.")
+				continue
+			}
+			if voteData.(*types.VoteData).SourceNumber > sourceNumber {
+				log.Error(fmt.Sprintf("error: cur vote %d-->%d is across the span of other votes %d-->%d",
+					sourceNumber, targetNumber, voteData.(*types.VoteData).SourceNumber, voteData.(*types.VoteData).TargetNumber))
+				return false, 0, common.Hash{}
+			}
+		}
+	}
+	for blockNumber := targetNumber + 1; blockNumber <= targetNumber+upperLimitOfVoteBlockNumber; blockNumber++ {
+		if voteDataBuffer.Contains(blockNumber) {
+			voteData, ok := voteDataBuffer.Get(blockNumber)
+			if !ok {
+				log.Error("Failed to get voteData info from LRU cache.")
+				continue
+			}
+			if voteData.(*types.VoteData).SourceNumber < sourceNumber {
+				log.Error(fmt.Sprintf("error: cur vote %d-->%d is within the span of other votes %d-->%d",
+					sourceNumber, targetNumber, voteData.(*types.VoteData).SourceNumber, voteData.(*types.VoteData).TargetNumber))
+				return false, 0, common.Hash{}
+			}
+		}
+	}
+
+	// Rule 3: Validators always vote for their canonical chain’s latest block.
+	// Since the header subscribed to is the canonical chain, so this rule is satisfied by default.
+	log.Info("All three rules check passed")
+	return true, sourceNumber, sourceHash
+}
+```
+
+
+
 ## Reward Rules:
 
 奖励在每个epoch结束时按权重分配
 
 - Validators whose vote is wrapped into the vote attestation can get one weight for reward(被包装到投票证明中的投票的验证者可以获得一个权重的奖励)
 - Validators who assemble vote attestation can get additional weights. The number of weights is equal to the number of extra votes than required（进行投票证明组装的验证者可获得额外权重。权重的数量等于比所需票数多出的票数）
-- The total reward is equal to the amount our system reward contract has grown over the last epoch. If the value of the system reward contract hits the upper limit, 1 BNB will be distributed
+- The total reward is equal to the amount our system reward contract has grown over the last epoch. If the value of the system reward contract hits the upper limit, 1 BNB will be distributed.(总奖励等于系统奖励合约比上一个epoch的增长量。 如果系统奖励合约的价值达到上限，将分配 1 BNB)
 
 ## forkchoice:
 
@@ -460,6 +526,85 @@ Verify the block header when receiving a new block.
 - If the block is not generate by inturn validatorvalidaror, will call slash contract. if there is gas-fee in the block, will distribute 1/16 to system reward contract, the rest go to validator contract.
 - The transaction generated by the consensus engine must be the same as the tx in block.
 
-## 发现的问题
+# The parlia protocol of bsc
 
-1.出块的顺序并非是节点接受区块的顺序
+```javascript
+validators, the set of validator;
+vote = <sourceblock,targetblock>;
+b, a block:
+	parent
+	sealer
+	number
+	difficulty
+
+vote:
+	address
+    signature
+    sourceblock
+    targetblock
+
+assembleVoteAttestation(header):
+	while votepool do
+		p<-header.parent
+		votes-<votepool.get(p.hash)
+		if len(votes)<2/3 then
+            return
+        j<-GetJustifiedblock()
+        createAttestation(j.number,j.hash,p.number,p.hash)
+        for v in votes
+            signatures = append(vote.Signature)
+        Serialize vote attestation and add to block header extra fields.
+
+seal(header):
+    while true do
+        n <- header.number
+        wait until sign-recently()
+        offset <- (n + 1) % (len(validators))
+        if validators[offset] = validator then
+            header.difficulty = 2
+            delay = time.until(header.time,0)
+        else 
+            header.difficulty = 1
+            delay = 200ms + rand(0,(len(validators)/2+1)*500ms)
+        assembleVoteAttestation(header)
+        sign()
+        broadcast()
+
+vote(header):
+	while isActiveValidator()
+        sourceblock <- GetJustifiedblock()
+        vote <- createVoteData(sourceblock,header)
+        if isUnderRules(header,vote)
+            //Rule 1: A validator must not publish two distinct votes for the same height.
+			//Rule 2: A validator must not vote within the span of its other votes. 
+			//Rule 3: Validators always vote for their canonical chain’s latest block.
+            votepool.putVote()
+             
+
+```
+
+#### 区块广播 bsc/eth/handler.go
+
+```javascript
+minedBroadcastLoop():
+	for:
+    	BroadcastBlock(Block, true)  // First propagate block to peers
+        BroadcastBlock(Block, false) // Only then announce to the rest
+
+BroadcastBlock(block, propagate):
+	h = block.hash
+	peers <- peersWithoutBlock(h)	//peersWithoutBlock retrieves a list of peers that do not have a given block in their set of known hashes, so it might be propagated to them.
+	if propagate:
+        if directBroadcast:		//似乎是一个可修改配置，原因为主网中区块传播延迟导致有一些空块，添加这个标志来缓解这种情况。
+            transfer = peers
+		else:
+        	transfer = peers[int(Sqrt(peers.len))]
+		for peer in transfer {
+			peer.AsyncSendNewBlock()
+		}
+	if HasBlock(block):
+		for peer in peers {
+			peer.AsyncSendNewBlockHash()
+		}
+```
+
