@@ -528,7 +528,7 @@ Verify the block header when receiving a new block.
 
 # The parlia protocol of bsc
 
-```javascript
+```go
 validators, the set of validator;
 vote = <sourceblock,targetblock>;
 b, a block:
@@ -539,9 +539,9 @@ b, a block:
 
 vote:
 	address
-    signature
-    sourceblock
-    targetblock
+	signature
+	sourceblock
+	targetblock
 
 assembleVoteAttestation(header):
 	while votepool do
@@ -575,17 +575,17 @@ vote(header):
         sourceblock <- GetJustifiedblock()
         vote <- createVoteData(sourceblock,header)
         if isUnderRules(header,vote)
-            //Rule 1: A validator must not publish two distinct votes for the same height.
-			//Rule 2: A validator must not vote within the span of its other votes. 
-			//Rule 3: Validators always vote for their canonical chain’s latest block.
-            votepool.putVote()
+		//Rule 1: A validator must not publish two distinct votes for the same height.
+		//Rule 2: A validator must not vote within the span of its other votes. 
+		//Rule 3: Validators always vote for their canonical chain’s latest block.
+		votepool.putVote()
              
 
 ```
 
 #### 区块广播 bsc/eth/handler.go
 
-```javascript
+```go
 minedBroadcastLoop():
 	for:
     	BroadcastBlock(Block, true)  // First propagate block to peers
@@ -596,12 +596,12 @@ BroadcastBlock(block, propagate):
 	peers <- peersWithoutBlock(h)	//peersWithoutBlock retrieves a list of peers that do not have a given block in their set of known hashes, so it might be propagated to them.
 	if propagate:
         if directBroadcast:		//似乎是一个可修改配置，原因为主网中区块传播延迟导致有一些空块，添加这个标志来缓解这种情况。
-            transfer = peers
-		else:
-        	transfer = peers[int(Sqrt(peers.len))]
-		for peer in transfer {
-			peer.AsyncSendNewBlock()
-		}
+		transfer = peers
+	else:
+	transfer = peers[int(Sqrt(peers.len))]
+	for peer in transfer {
+		peer.AsyncSendNewBlock()
+	}
 	if HasBlock(block):
 		for peer in peers {
 			peer.AsyncSendNewBlockHash()
